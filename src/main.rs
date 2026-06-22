@@ -22,6 +22,8 @@ use egui::{Color32, RichText};
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use winreg::HKEY;
 use winreg::RegKey;
@@ -697,6 +699,13 @@ enum Tab {
     Advanced,
 }
 
+/// Results from background worker threads, drained on the UI thread each frame.
+enum Job {
+    Log(String),
+    Exclusions(Vec<String>),
+    Refresh,
+}
+
 struct DefenderControlApp {
     sys: SysInfo,
     elevated: bool,
@@ -713,10 +722,15 @@ struct DefenderControlApp {
     logs: Vec<String>,
     logo: Option<egui::TextureHandle>,
     update: Arc<Mutex<UpdateState>>,
+    update_checking: Arc<AtomicBool>,
+    busy: Arc<AtomicBool>,
+    job_tx: Sender<Job>,
+    job_rx: Receiver<Job>,
 }
 
 impl Default for DefenderControlApp {
     fn default() -> Self {
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             sys: detect_system(),
             elevated: false,
@@ -733,6 +747,10 @@ impl Default for DefenderControlApp {
             logs: Vec::new(),
             logo: None,
             update: Arc::new(Mutex::new(UpdateState::Checking)),
+            update_checking: Arc::new(AtomicBool::new(false)),
+            busy: Arc::new(AtomicBool::new(false)),
+            job_tx,
+            job_rx,
         };
         app.refresh();
         app.log("Ready.");
@@ -749,23 +767,60 @@ impl DefenderControlApp {
 
     fn log(&mut self, msg: impl Into<String>) {
         self.logs.push(format!("[{}]  {}", timestamp(), msg.into()));
-    }
-
-    fn reload_exclusions(&mut self) {
-        self.exclusions = defender_list_exclusions();
-        self.exclusions_loaded = true;
+        // Cap the log so it can't grow without bound over a long session.
+        const MAX_LOGS: usize = 300;
+        if self.logs.len() > MAX_LOGS {
+            self.logs.drain(0..self.logs.len() - MAX_LOGS);
+        }
     }
 
     /// Kick off a background update check (keeps the UI responsive).
     fn spawn_update_check(&self, ctx: &egui::Context) {
+        if self.update_checking.swap(true, Ordering::SeqCst) {
+            return; // a check is already in flight
+        }
         *self.update.lock().unwrap() = UpdateState::Checking;
         let upd = self.update.clone();
+        let flag = self.update_checking.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let result = check_for_update();
             *upd.lock().unwrap() = result;
+            flag.store(false, Ordering::SeqCst);
             ctx.request_repaint();
         });
+    }
+
+    /// Run a slow (PowerShell / sc) action off the UI thread; only one job runs
+    /// at a time. Results stream back via the channel and are drained per frame.
+    fn spawn_job<F>(&self, ctx: &egui::Context, f: F)
+    where
+        F: FnOnce(&Sender<Job>) + Send + 'static,
+    {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return; // a job is already running
+        }
+        let tx = self.job_tx.clone();
+        let busy = self.busy.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            f(&tx);
+            busy.store(false, Ordering::SeqCst);
+            ctx.request_repaint();
+        });
+    }
+
+    fn drain_jobs(&mut self) {
+        while let Ok(job) = self.job_rx.try_recv() {
+            match job {
+                Job::Log(s) => self.log(s),
+                Job::Exclusions(v) => {
+                    self.exclusions = v;
+                    self.exclusions_loaded = true;
+                }
+                Job::Refresh => self.refresh(),
+            }
+        }
     }
 
     /// Download + install the update in the background, then quit so the
@@ -786,6 +841,8 @@ impl DefenderControlApp {
 
 impl eframe::App for DefenderControlApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.drain_jobs();
+
         // Pinned activity log at the bottom.
         egui::Panel::bottom("activity_log")
             .resizable(false)
@@ -863,12 +920,14 @@ impl DefenderControlApp {
                     ui.hyperlink_to(
                         RichText::new("robloxscripts.com").size(12.0),
                         "https://robloxscripts.com",
-                    );
+                    )
+                    .on_hover_text("The best place to get and share Roblox scripts.");
                     ui.label(RichText::new("&").size(12.0).color(MUTED));
                     ui.hyperlink_to(
                         RichText::new("rsware.store").size(12.0),
                         "https://rsware.store",
-                    );
+                    )
+                    .on_hover_text("The best place to buy Roblox executors & externals.");
                 });
             });
         });
@@ -995,12 +1054,24 @@ impl DefenderControlApp {
                 self.log("Refreshed status.");
             }
             if ui.button("Verify real state (live)").clicked() {
-                match defender_live_status() {
-                    Ok(s) => self.log(format!("Live — {s}")),
-                    Err(e) => self.log(format!("Live check failed: {e}")),
-                }
+                let ctx = ui.ctx().clone();
+                self.spawn_job(&ctx, |tx| {
+                    let msg = match defender_live_status() {
+                        Ok(s) => format!("Live — {s}"),
+                        Err(e) => format!("Live check failed: {e}"),
+                    };
+                    let _ = tx.send(Job::Log(msg));
+                });
             }
         });
+
+        if self.busy.load(Ordering::SeqCst) {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Working…").size(12.0).color(MUTED));
+            });
+        }
 
         ui.add_space(6.0);
         let upd = self.update.lock().unwrap().clone();
@@ -1101,23 +1172,21 @@ impl DefenderControlApp {
             );
         });
         ui.horizontal(|ui| {
-            if ui.button("Browse file…").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
+            if ui.button("Browse file…").clicked()
+                && let Some(p) = rfd::FileDialog::new()
                     .set_title("Select a program to exclude")
                     .add_filter("Programs", &["exe"])
                     .pick_file()
                 {
                     self.exclusion_path = p.display().to_string();
                 }
-            }
-            if ui.button("Browse folder…").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
+            if ui.button("Browse folder…").clicked()
+                && let Some(p) = rfd::FileDialog::new()
                     .set_title("Select a folder to exclude")
                     .pick_folder()
                 {
                     self.exclusion_path = p.display().to_string();
                 }
-            }
         });
         ui.horizontal(|ui| {
             if ui.button("Add exclusion").clicked() {
@@ -1125,13 +1194,16 @@ impl DefenderControlApp {
                 if p.is_empty() {
                     self.log("Enter or browse a path first.");
                 } else {
-                    match defender_add_exclusion(&p) {
+                    let ctx = ui.ctx().clone();
+                    self.spawn_job(&ctx, move |tx| match defender_add_exclusion(&p) {
                         Ok(()) => {
-                            self.log(format!("Added Defender exclusion: {p}"));
-                            self.reload_exclusions();
+                            let _ = tx.send(Job::Log(format!("Added Defender exclusion: {p}")));
+                            let _ = tx.send(Job::Exclusions(defender_list_exclusions()));
                         }
-                        Err(e) => self.log(format!("Add exclusion failed: {e}")),
-                    }
+                        Err(e) => {
+                            let _ = tx.send(Job::Log(format!("Add exclusion failed: {e}")));
+                        }
+                    });
                 }
             }
             if ui.button("Remove exclusion").clicked() {
@@ -1139,18 +1211,25 @@ impl DefenderControlApp {
                 if p.is_empty() {
                     self.log("Enter or browse a path first.");
                 } else {
-                    match defender_remove_exclusion(&p) {
+                    let ctx = ui.ctx().clone();
+                    self.spawn_job(&ctx, move |tx| match defender_remove_exclusion(&p) {
                         Ok(()) => {
-                            self.log(format!("Removed Defender exclusion: {p}"));
-                            self.reload_exclusions();
+                            let _ = tx.send(Job::Log(format!("Removed Defender exclusion: {p}")));
+                            let _ = tx.send(Job::Exclusions(defender_list_exclusions()));
                         }
-                        Err(e) => self.log(format!("Remove exclusion failed: {e}")),
-                    }
+                        Err(e) => {
+                            let _ = tx.send(Job::Log(format!("Remove exclusion failed: {e}")));
+                        }
+                    });
                 }
             }
             if ui.button("Refresh list").clicked() {
-                self.reload_exclusions();
-                self.log(format!("Loaded {} Defender exclusion(s).", self.exclusions.len()));
+                let ctx = ui.ctx().clone();
+                self.spawn_job(&ctx, |tx| {
+                    let list = defender_list_exclusions();
+                    let _ = tx.send(Job::Log(format!("Loaded {} Defender exclusion(s).", list.len())));
+                    let _ = tx.send(Job::Exclusions(list));
+                });
             }
         });
         if self.exclusions_loaded {
@@ -1163,11 +1242,17 @@ impl DefenderControlApp {
                 for ex in &current {
                     ui.horizontal(|ui| {
                         if ui.small_button("Remove").clicked() {
-                            match defender_remove_exclusion(ex) {
-                                Ok(()) => self.log(format!("Removed exclusion: {ex}")),
-                                Err(e) => self.log(format!("Remove failed: {e}")),
-                            }
-                            self.reload_exclusions();
+                            let ctx = ui.ctx().clone();
+                            let ex = ex.clone();
+                            self.spawn_job(&ctx, move |tx| match defender_remove_exclusion(&ex) {
+                                Ok(()) => {
+                                    let _ = tx.send(Job::Log(format!("Removed exclusion: {ex}")));
+                                    let _ = tx.send(Job::Exclusions(defender_list_exclusions()));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Job::Log(format!("Remove failed: {e}")));
+                                }
+                            });
                         }
                         ui.label(RichText::new(ex).color(TEXT));
                     });
@@ -1278,15 +1363,14 @@ impl DefenderControlApp {
                     .hint_text(r"C:\path\to\program.exe")
                     .desired_width(190.0),
             );
-            if ui.button("Browse…").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
+            if ui.button("Browse…").clicked()
+                && let Some(p) = rfd::FileDialog::new()
                     .set_title("Select the program to allow")
                     .add_filter("Programs", &["exe"])
                     .pick_file()
                 {
                     self.firewall_exe_path = p.display().to_string();
                 }
-            }
         });
         ui.horizontal(|ui| {
             if ui.button("Allow through firewall").clicked() {
@@ -1342,11 +1426,14 @@ impl DefenderControlApp {
                 )
                 .clicked()
             {
-                self.log("--- Aggressive disable ---");
-                for line in aggressive_disable() {
-                    self.log(line);
-                }
-                self.refresh();
+                let ctx = ui.ctx().clone();
+                self.spawn_job(&ctx, |tx| {
+                    let _ = tx.send(Job::Log("--- Aggressive disable ---".to_owned()));
+                    for line in aggressive_disable() {
+                        let _ = tx.send(Job::Log(line));
+                    }
+                    let _ = tx.send(Job::Refresh);
+                });
             }
             if ui
                 .add(
@@ -1356,11 +1443,14 @@ impl DefenderControlApp {
                 )
                 .clicked()
             {
-                self.log("--- Full re-enable ---");
-                for line in full_reenable() {
-                    self.log(line);
-                }
-                self.refresh();
+                let ctx = ui.ctx().clone();
+                self.spawn_job(&ctx, |tx| {
+                    let _ = tx.send(Job::Log("--- Full re-enable ---".to_owned()));
+                    for line in full_reenable() {
+                        let _ = tx.send(Job::Log(line));
+                    }
+                    let _ = tx.send(Job::Refresh);
+                });
             }
         });
     }
@@ -1392,8 +1482,10 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
-            let mut app = DefenderControlApp::default();
-            app.logo = load_logo(&cc.egui_ctx);
+            let app = DefenderControlApp {
+                logo: load_logo(&cc.egui_ctx),
+                ..Default::default()
+            };
             app.spawn_update_check(&cc.egui_ctx);
             Ok(Box::new(app))
         }),

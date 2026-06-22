@@ -7,6 +7,9 @@ getting Roblox executors / externals running without the usual headaches.
 **Fully vibe coded by [robloxscripts.com](https://robloxscripts.com) &
 [rsware.store](https://rsware.store).**
 
+- **[robloxscripts.com](https://robloxscripts.com)** — the best place to get and share Roblox scripts.
+- **[rsware.store](https://rsware.store)** — the best place to buy Roblox executors & externals.
+
 Works on **Windows 10 and Windows 11** (64-bit). Single self-contained `.exe` —
 nothing to install (the C runtime is statically linked, so there's no Visual C++
 Redistributable to chase down).
