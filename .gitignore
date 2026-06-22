@@ -1,0 +1,10 @@
+# Rust build output
+/target
+
+# IDE / editor / agent
+/.vs
+/.claude
+
+# OS cruft
+Thumbs.db
+desktop.ini
